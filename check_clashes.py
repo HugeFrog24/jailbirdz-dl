@@ -18,7 +18,7 @@ Importable functions:
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath
-from typing import Any, Optional, cast
+from typing import Any, cast
 
 from collections.abc import Callable
 from urllib.parse import urlparse, unquote
@@ -131,8 +131,7 @@ def build_url_referers(video_map: dict[str, Any]) -> dict[str, str]:
         parsed = urlparse(page_url)
         referer = f"{parsed.scheme}://{parsed.netloc}/"
         for vid in cast(dict[str, Any], entry).get("videos", []):
-            if isinstance(vid, str):
-                result.setdefault(vid, referer)
+            result.setdefault(vid["url"], referer)
     return result
 
 
@@ -252,12 +251,7 @@ def fetch_sizes(
 
 def main() -> None:
     vm = load_video_map()
-    urls = [
-        u
-        for entry in vm.values()
-        for u in entry.get("videos", [])
-        if u.startswith("http")
-    ]
+    urls = [vid["url"] for entry in vm.values() for vid in entry.get("videos", [])]
 
     clashes = find_clashes(urls)
 

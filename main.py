@@ -6,7 +6,7 @@ import signal
 import asyncio
 import requests
 from pathlib import PurePosixPath
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, BrowserContext
@@ -476,9 +476,13 @@ async def worker(
                 entry = video_map.get(url, {})
                 if title:
                     entry["title"] = title
-                existing_videos = set(entry.get("videos", []))
-                existing_videos.update(all_videos)
-                entry["videos"] = sorted(existing_videos)
+                existing_dict: dict[str, Any] = {
+                    vid["url"]: vid for vid in entry.get("videos", [])
+                }
+                for vid_url in all_videos:
+                    if vid_url not in existing_dict:
+                        existing_dict[vid_url] = {"url": vid_url}
+                entry["videos"] = sorted(existing_dict.values(), key=lambda v: v["url"])
                 mark_done = bool(all_videos) or not expects_video(url)
                 if mark_done:
                     entry["scraped_at"] = int(time.time())
@@ -526,7 +530,9 @@ async def run_for_site(
             site_key, base_url, wp_api, video_map, urls, req_headers
         )
 
-    known = {u for entry in video_map.values() for u in entry.get("videos", [])}
+    known = {
+        vid["url"] for entry in video_map.values() for vid in entry.get("videos", [])
+    }
 
     total = len(urls)
     pending = []

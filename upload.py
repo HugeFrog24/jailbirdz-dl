@@ -32,11 +32,11 @@ import requests
 from dotenv import load_dotenv
 
 from check_clashes import fmt_size, url_to_filename, VIDEO_EXTS, load_video_map
-from config import SITES
 from download import (
     collect_urls,
     get_paths_for_mode,
     read_mode,
+    build_url_to_site,
     MODE_ORIGINAL,
     DEFAULT_OUTPUT,
 )
@@ -412,11 +412,7 @@ def build_path_to_meta(
     urls = collect_urls(video_map)
     mode = read_mode(input_dir) or MODE_ORIGINAL
 
-    url_to_site: dict[str, str] = {}
-    for site_key in SITES:
-        for entry in load_video_map(site_key).values():
-            for vid_url in entry.get("videos", []):
-                url_to_site[vid_url] = site_key
+    url_to_site = build_url_to_site()
 
     paths = get_paths_for_mode(mode, urls, video_map, input_dir, url_to_site)
 
@@ -429,13 +425,9 @@ def build_path_to_meta(
         title = t if isinstance(t, str) else ""
         desc = d if isinstance(d, str) else ""
 
-        videos_any = entry.get("videos", [])
-        if isinstance(videos_any, list):
-            for video_url_any in videos_any:
-                if not isinstance(video_url_any, str):
-                    continue
-                if video_url_any not in url_meta:
-                    url_meta[video_url_any] = {"title": title, "description": desc}
+        for vid in entry.get("videos", []):
+            if vid["url"] not in url_meta:
+                url_meta[vid["url"]] = {"title": title, "description": desc}
 
     result: dict[Path, dict[str, str]] = {}
     for url, abs_path in paths.items():

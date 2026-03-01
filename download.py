@@ -16,7 +16,7 @@ import re
 import shutil
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Optional
+from typing import Any
 import requests
 
 from check_clashes import (
@@ -264,12 +264,13 @@ def download_one(
 def collect_urls(video_map: dict[str, Any]) -> list[str]:
     urls, seen, skipped = [], set(), 0
     for entry in video_map.values():
-        for video_url in entry.get("videos", []):
-            if video_url in seen:
+        for vid in entry.get("videos", []):
+            u = vid["url"]
+            if u in seen:
                 continue
-            seen.add(video_url)
-            if is_valid_url(video_url):
-                urls.append(video_url)
+            seen.add(u)
+            if is_valid_url(u):
+                urls.append(u)
             else:
                 skipped += 1
     if skipped:
@@ -281,10 +282,20 @@ def build_url_title_map(video_map: dict[str, Any]) -> dict[str, str]:
     url_title = {}
     for entry in video_map.values():
         title = entry.get("title", "")
-        for video_url in entry.get("videos", []):
-            if video_url not in url_title:
-                url_title[video_url] = title
+        for vid in entry.get("videos", []):
+            if vid["url"] not in url_title:
+                url_title[vid["url"]] = title
     return url_title
+
+
+def build_url_to_site() -> dict[str, str]:
+    """Return {cdn_video_url: site_key} by loading each site's map in turn."""
+    result: dict[str, str] = {}
+    for site_key in SITES:
+        for entry in load_video_map(site_key).values():
+            for vid in entry.get("videos", []):
+                result[vid["url"]] = site_key
+    return result
 
 
 # ── Main ─────────────────────────────────────────────────────────────
@@ -341,11 +352,7 @@ def main() -> None:
     url_referers = build_url_referers(video_map)
     urls = collect_urls(video_map)
 
-    url_to_site: dict[str, str] = {}
-    for site_key in SITES:
-        for entry in load_video_map(site_key).values():
-            for vid_url in entry.get("videos", []):
-                url_to_site[vid_url] = site_key
+    url_to_site = build_url_to_site()
 
     if args.sites:
         selected = set(args.sites)
@@ -409,17 +416,44 @@ def main() -> None:
             print(f"  … and {len(pending) - 20} more")
         return
 
-    print("\n[+] Fetching remote file sizes…")
+    cached_sizes: dict[str, int] = {
+        vid["url"]: vid["size"]
+        for entry in video_map.values()
+        for vid in entry.get("videos", [])
+        if vid.get("size") is not None
+    }
+
+    uncached_pending = [u for u in pending if u not in cached_sizes]
     session = make_session()
-    remote_sizes = fetch_sizes(pending, workers=20, url_referers=url_referers)
+    if uncached_pending:
+        print(
+            f"\n[+] Fetching remote file sizes ({len(uncached_pending)} uncached, {len(pending) - len(uncached_pending)} cached)…"
+        )
+        remote_sizes: dict[str, int | None] = {
+            **cached_sizes,
+            **fetch_sizes(uncached_pending, workers=20, url_referers=url_referers),
+        }
+    else:
+        print(f"\n[+] All {len(pending)} pending sizes cached — skipping probe.")
+        remote_sizes = dict(cached_sizes)
 
     sized = {u: s for u, s in remote_sizes.items() if s is not None}
     total_bytes = sum(sized.values())
     print(f"[+] Download size: {fmt_size(total_bytes)} across {len(pending)} files")
 
     if already:
-        print(f"[+] Verifying {len(already)} existing files…")
-        already_sizes = fetch_sizes(already, workers=20, url_referers=url_referers)
+        uncached_already = [u for u in already if u not in cached_sizes]
+        if uncached_already:
+            print(
+                f"[+] Verifying {len(already)} existing files ({len(uncached_already)} uncached)…"
+            )
+            already_sizes: dict[str, int | None] = {
+                **cached_sizes,
+                **fetch_sizes(uncached_already, workers=20, url_referers=url_referers),
+            }
+        else:
+            print(f"[+] Verifying {len(already)} existing files (all sizes cached)…")
+            already_sizes = dict(cached_sizes)
 
     mismatched = 0
     for url in already:

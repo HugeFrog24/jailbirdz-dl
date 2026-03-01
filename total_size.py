@@ -4,16 +4,41 @@ Importable function:
     summarize_sizes(sizes) - return dict with total, smallest, largest, average, failed
 """
 
-from check_clashes import fmt_size, fetch_sizes, load_video_map, VIDEO_MAP_FILE
+from typing import Optional, TypedDict
+
+from check_clashes import (
+    fmt_size,
+    fetch_sizes,
+    load_video_map,
+    build_url_referers,
+    VIDEO_MAP_FILE,
+)
 
 
-def summarize_sizes(sizes):
+class SizeStats(TypedDict):
+    sized: int
+    total: int
+    total_bytes: int
+    smallest: int
+    largest: int
+    average: int
+    failed: list[str]
+
+
+def summarize_sizes(sizes: dict[str, Optional[int]]) -> SizeStats:
     """Given {url: size_or_None}, return a stats dict."""
     known = {u: s for u, s in sizes.items() if s is not None}
     failed = [u for u, s in sizes.items() if s is None]
     if not known:
-        return {"sized": 0, "total": len(sizes), "total_bytes": 0,
-                "smallest": 0, "largest": 0, "average": 0, "failed": failed}
+        return {
+            "sized": 0,
+            "total": len(sizes),
+            "total_bytes": 0,
+            "smallest": 0,
+            "largest": 0,
+            "average": 0,
+            "failed": failed,
+        }
     total_bytes = sum(known.values())
     return {
         "sized": len(known),
@@ -28,19 +53,28 @@ def summarize_sizes(sizes):
 
 # --------------- CLI ---------------
 
-def _progress(done, total):
+
+def _progress(done: int, total: int) -> None:
     if done % 200 == 0 or done == total:
         print(f"    {done}/{total}")
 
 
-def main():
+def main() -> None:
     vm = load_video_map()
-    urls = [u for entry in vm.values() for u in entry.get("videos", []) if u.startswith("http")]
+    urls: list[str] = [
+        u
+        for entry in vm.values()
+        for u in entry.get("videos", [])
+        if u.startswith("http")
+    ]
 
+    url_referers = build_url_referers(vm)
     print(f"[+] {len(urls)} URLs in {VIDEO_MAP_FILE}")
     print("[+] Fetching file sizes (20 threads)…\n")
 
-    sizes = fetch_sizes(urls, workers=20, on_progress=_progress)
+    sizes = fetch_sizes(
+        urls, workers=20, on_progress=_progress, url_referers=url_referers
+    )
     stats = summarize_sizes(sizes)
 
     print(f"\n{'=' * 45}")

@@ -1,5 +1,14 @@
+# Temporary cache
 __pycache__/
+.ruff_cache/
+
+# Local IDE config
+.vscode
+
+# Project output & artifacts
 downloads/
 *.mp4
 *.mp4.part
+
+# Secrets & sensitive info
 .env

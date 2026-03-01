@@ -1,113 +1,130 @@
 #!/usr/bin/env python3
 """
-grab_cookie.py — read the WordPress login cookie from an
-installed browser and write it to .env as WP_LOGIN_COOKIE=name=value.
+grab_cookie.py — log in to a site and write the session cookie to .env.
+
+Requires {SITE}_USERNAME and {SITE}_PASSWORD to be set in the environment or .env.
 
 Usage:
-    python grab_cookie.py                        # tries Firefox, Chrome, Edge, Brave
-    python grab_cookie.py --browser firefox      # explicit browser
+    python grab_cookie.py --site jailbirdz
+    python grab_cookie.py --site pinkcuffs
 """
 
 import argparse
+import os
 from pathlib import Path
-from config import COOKIE_DOMAIN
+from typing import Literal
+import requests
+from config import SITES
 
 ENV_FILE = Path(".env")
-ENV_KEY = "WP_LOGIN_COOKIE"
 COOKIE_PREFIX = "wordpress_logged_in_"
 
-BROWSER_NAMES = ["firefox", "chrome", "edge", "brave"]
 
+def update_env(
+    name: str,
+    value: str,
+    env_key: str = "WP_LOGIN_COOKIE",
+    path: Path = ENV_FILE,
+) -> Literal["updated", "appended", "created"]:
+    """Write env_key=name=value into the env file, replacing any existing line."""
+    new_line = f"{env_key}={name}={value}\n"
 
-def find_cookie(browser_name):
-    """Return (name, value) for the wordpress_logged_in_* cookie, or (None, None)."""
-    try:
-        import rookiepy
-    except ImportError:
-        raise ImportError("rookiepy not installed — run: pip install rookiepy")
-
-    fn = getattr(rookiepy, browser_name, None)
-    if fn is None:
-        raise ValueError(f"rookiepy does not support '{browser_name}'.")
-
-    try:
-        cookies = fn([COOKIE_DOMAIN])
-    except PermissionError:
-        raise PermissionError(
-            f"Permission denied reading {browser_name} cookies.\n"
-            "    Close the browser, or on Windows run as Administrator for Chrome/Edge."
-        )
-    except Exception as e:
-        raise RuntimeError(f"Could not read {browser_name} cookies: {e}")
-
-    for c in cookies:
-        if c.get("name", "").startswith(COOKIE_PREFIX):
-            return c["name"], c["value"]
-
-    return None, None
-
-
-def update_env(name, value):
-    """Write WP_LOGIN_COOKIE=name=value into .env, replacing any existing line."""
-    new_line = f"{ENV_KEY}={name}={value}\n"
-
-    if ENV_FILE.exists():
-        text = ENV_FILE.read_text(encoding="utf-8")
+    if path.exists():
+        text = path.read_text(encoding="utf-8")
         lines = text.splitlines(keepends=True)
         for i, line in enumerate(lines):
-            if line.startswith(f"{ENV_KEY}=") or line.strip() == ENV_KEY:
+            key, sep, _ = line.partition("=")
+            if key.strip() == env_key and sep:
                 lines[i] = new_line
-                ENV_FILE.write_text("".join(lines), encoding="utf-8")
+                path.write_text("".join(lines), encoding="utf-8")
                 return "updated"
         # Key not present — append
         if text and not text.endswith("\n"):
             text += "\n"
-        ENV_FILE.write_text(text + new_line, encoding="utf-8")
+        path.write_text(text + new_line, encoding="utf-8")
         return "appended"
     else:
-        ENV_FILE.write_text(new_line, encoding="utf-8")
+        path.write_text(new_line, encoding="utf-8")
         return "created"
 
 
-def main():
+def login_and_get_cookie(
+    username: str, password: str, base_url: str
+) -> tuple[str, str]:
+    """POST to wp-admin/admin-ajax.php (xootix action) and return (cookie_name, cookie_value).
+
+    No browser needed — the xootix login endpoint takes plain form fields and returns
+    the wordpress_logged_in_* cookie directly in the response Set-Cookie headers.
+    """
+    session = requests.Session()
+    r = session.post(
+        f"{base_url}/wp-admin/admin-ajax.php",
+        data={
+            "xoo-el-username": username,
+            "xoo-el-password": password,
+            "xoo-el-rememberme": "forever",
+            "_xoo_el_form": "login",
+            "xoo_el_redirect": "/",
+            "action": "xoo_el_form_action",
+            "display": "popup",
+        },
+        headers={
+            "Referer": f"{base_url}/",
+            "Origin": base_url,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0",
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    result = r.json()
+    if result.get("error"):
+        raise RuntimeError(f"Login rejected by server: {result.get('notice', result)}")
+
+    for name, value in session.cookies.items():
+        if name.startswith(COOKIE_PREFIX):
+            return name, value
+
+    raise RuntimeError(
+        "Server accepted login but no wordpress_logged_in_* cookie was set.\n"
+        "    Check that username and password are correct."
+    )
+
+
+def _auto_login() -> None:
     parser = argparse.ArgumentParser(
-        description=f"Copy the {COOKIE_DOMAIN} login cookie from your browser into .env."
+        description="Log in and save session cookie to .env"
     )
     parser.add_argument(
-        "--browser", "-b",
-        choices=BROWSER_NAMES,
-        metavar="BROWSER",
-        help=f"Browser to read from: {', '.join(BROWSER_NAMES)} (default: try all in order)",
+        "--site",
+        required=True,
+        choices=list(SITES.keys()),
+        help="Which site to authenticate with",
     )
     args = parser.parse_args()
 
-    order = [args.browser] if args.browser else BROWSER_NAMES
+    site_cfg = SITES[args.site]
+    env_prefix = site_cfg["env_prefix"]
+    base_url = site_cfg["base_url"]
+    env_key = f"{env_prefix}_LOGIN_COOKIE"
 
-    cookie_name = cookie_value = None
-    for browser in order:
-        print(f"[…] Trying {browser}…")
-        try:
-            cookie_name, cookie_value = find_cookie(browser)
-        except ImportError as e:
-            raise SystemExit(f"[!] {e}")
-        except (ValueError, PermissionError, RuntimeError) as e:
-            print(f"[!] {e}")
-            continue
-
-        if cookie_name:
-            print(f"[+] Found in {browser}: {cookie_name}")
-            break
-        print(f"    No {COOKIE_PREFIX}* cookie found in {browser}.")
-
-    if not cookie_name:
+    username = os.environ.get(f"{env_prefix}_USERNAME", "").strip()
+    password = os.environ.get(f"{env_prefix}_PASSWORD", "").strip()
+    if not username or not password:
         raise SystemExit(
-            f"\n[!] No {COOKIE_PREFIX}* cookie found in any browser.\n"
-            f"    Make sure you are logged into {COOKIE_DOMAIN}, then re-run.\n"
-            "    Or set WP_LOGIN_COOKIE manually in .env — see .env.example."
+            f"[!] {env_prefix}_USERNAME and {env_prefix}_PASSWORD must be set "
+            "in the environment or .env — see .env.example."
         )
+    try:
+        cookie_name, cookie_value = login_and_get_cookie(username, password, base_url)
+    except RuntimeError as e:
+        raise SystemExit(f"[!] {e}")
+    print(f"[+] Login succeeded: {cookie_name}")
+    action = update_env(cookie_name, cookie_value, env_key=env_key)
+    print(f"[✓] {env_key} {action} in {ENV_FILE}.")
 
-    action = update_env(cookie_name, cookie_value)
-    print(f"[✓] {ENV_KEY} {action} in {ENV_FILE}.")
+
+def main() -> None:
+    _auto_login()
 
 
 if __name__ == "__main__":

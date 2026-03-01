@@ -26,13 +26,14 @@ from pathlib import Path
 import re
 import sys
 import time
+from typing import Any, cast
 
 import requests
 from dotenv import load_dotenv
 
-from check_clashes import fmt_size, url_to_filename, VIDEO_EXTS
+from check_clashes import fmt_size, url_to_filename, VIDEO_EXTS, load_video_map
+from config import SITES
 from download import (
-    load_video_map,
     collect_urls,
     get_paths_for_mode,
     read_mode,
@@ -52,21 +53,21 @@ PT_NAME_MAX = 120
 
 # ── Text helpers ─────────────────────────────────────────────────────
 
-def clean_description(raw):
+
+def clean_description(raw: str) -> str:
     """Strip WordPress shortcodes and HTML from a description."""
     if not raw:
         return ""
-    text = re.sub(r'\[/?[^\]]+\]', '', raw)
-    text = re.sub(r'<[^>]+>', '', text)
+    text = re.sub(r"\[/?[^\]]+\]", "", raw)
+    text = re.sub(r"<[^>]+>", "", text)
     text = html.unescape(text)
-    text = re.sub(r'\n{3,}', '\n\n', text).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text[:10000]
 
 
-def make_pt_name(title, fallback_filename):
+def make_pt_name(title: str, fallback_filename: str) -> str:
     """Build a PeerTube-safe video name (3-120 chars)."""
-    name = html.unescape(title).strip(
-    ) if title else Path(fallback_filename).stem
+    name = html.unescape(title).strip() if title else Path(fallback_filename).stem
     if len(name) > PT_NAME_MAX:
         name = name[: PT_NAME_MAX - 1].rstrip() + "\u2026"
     while len(name) < 3:
@@ -76,7 +77,8 @@ def make_pt_name(title, fallback_filename):
 
 # ── PeerTube API ─────────────────────────────────────────────────────
 
-def get_oauth_token(base, username, password):
+
+def get_oauth_token(base: str, username: str, password: str) -> str:
     r = requests.get(f"{base}/api/v1/oauth-clients/local", timeout=15)
     r.raise_for_status()
     client = r.json()
@@ -93,26 +95,36 @@ def get_oauth_token(base, username, password):
         timeout=15,
     )
     r.raise_for_status()
-    return r.json()["access_token"]
+    data_any: Any = r.json()
+    data = cast(dict[str, Any], data_any)
+    token = data.get("access_token")
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("PeerTube token response missing access_token")
+    return token
 
 
-def api_headers(token):
+def api_headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-def get_channel_id(base, token, channel_name):
+def get_channel_id(base: str, token: str, channel_name: str) -> int:
     r = requests.get(
         f"{base}/api/v1/video-channels/{channel_name}",
         headers=api_headers(token),
         timeout=15,
     )
     r.raise_for_status()
-    return r.json()["id"]
+    data_any: Any = r.json()
+    data = cast(dict[str, Any], data_any)
+    cid = data.get("id")
+    if not isinstance(cid, int):
+        raise RuntimeError("PeerTube channel response missing id")
+    return cid
 
 
-def get_channel_video_names(base, token, channel_name):
+def get_channel_video_names(base: str, token: str, channel_name: str) -> Counter[str]:
     """Paginate through the channel and return a Counter of video names."""
-    counts = Counter()
+    counts: Counter[str] = Counter()
     start = 0
     while True:
         r = requests.get(
@@ -135,8 +147,16 @@ CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB
 MAX_RETRIES = 5
 
 
-def _init_resumable(base, token, channel_id, filepath, filename, name,
-                    description="", nsfw=False):
+def _init_resumable(
+    base: str,
+    token: str,
+    channel_id: int,
+    filepath: Path,
+    filename: str,
+    name: str,
+    description: str = "",
+    nsfw: bool = False,
+) -> tuple[str, int]:
     """POST to create a resumable upload session.  Returns upload URL."""
     file_size = Path(filepath).stat().st_size
     metadata = {
@@ -171,7 +191,7 @@ def _init_resumable(base, token, channel_id, filepath, filename, name,
     return location, file_size
 
 
-def _query_offset(upload_url, token, file_size):
+def _query_offset(upload_url: str, token: str, file_size: int) -> int:
     """Ask the server how many bytes it has received so far."""
     r = requests.put(
         upload_url,
@@ -193,8 +213,15 @@ def _query_offset(upload_url, token, file_size):
     return 0
 
 
-def upload_video(base, token, channel_id, filepath, name,
-                 description="", nsfw=False):
+def upload_video(
+    base: str,
+    token: str,
+    channel_id: int,
+    filepath: Path,
+    name: str,
+    description: str = "",
+    nsfw: bool = False,
+) -> tuple[bool, str | None]:
     """Resumable chunked upload.  Returns (ok, uuid)."""
     filepath = Path(filepath)
     filename = filepath.name
@@ -202,8 +229,14 @@ def upload_video(base, token, channel_id, filepath, name,
 
     try:
         upload_url, _ = _init_resumable(
-            base, token, channel_id, filepath, filename,
-            name, description, nsfw,
+            base,
+            token,
+            channel_id,
+            filepath,
+            filename,
+            name,
+            description,
+            nsfw,
         )
     except Exception as e:
         print(f"    Init failed: {e}")
@@ -221,8 +254,11 @@ def upload_video(base, token, channel_id, filepath, name,
             chunk = f.read(chunk_len)
 
             pct = int(100 * (end + 1) / file_size)
-            print(f"    {fmt_size(offset)}/{fmt_size(file_size)}  ({pct}%)",
-                  end="\r", flush=True)
+            print(
+                f"    {fmt_size(offset)}/{fmt_size(file_size)}  ({pct}%)",
+                end="\r",
+                flush=True,
+            )
 
             try:
                 r = requests.put(
@@ -239,12 +275,13 @@ def upload_video(base, token, channel_id, filepath, name,
             except (requests.ConnectionError, requests.Timeout) as e:
                 retries += 1
                 if retries > MAX_RETRIES:
-                    print(
-                        f"\n    Upload failed after {MAX_RETRIES} retries: {e}")
+                    print(f"\n    Upload failed after {MAX_RETRIES} retries: {e}")
                     return False, None
-                wait = min(2 ** retries, 60)
-                print(f"\n    Connection error, retry {retries}/{MAX_RETRIES} "
-                      f"in {wait}s ...")
+                wait = min(2**retries, 60)
+                print(
+                    f"\n    Connection error, retry {retries}/{MAX_RETRIES} "
+                    f"in {wait}s ..."
+                )
                 time.sleep(wait)
                 try:
                     offset = _query_offset(upload_url, token, file_size)
@@ -261,8 +298,7 @@ def upload_video(base, token, channel_id, filepath, name,
                 retries = 0
 
             elif r.status_code == 200:
-                print(
-                    f"    {fmt_size(file_size)}/{fmt_size(file_size)}  (100%)")
+                print(f"    {fmt_size(file_size)}/{fmt_size(file_size)}  (100%)")
                 uuid = r.json().get("video", {}).get("uuid")
                 return True, uuid
 
@@ -270,11 +306,9 @@ def upload_video(base, token, channel_id, filepath, name,
                 retry_after = int(r.headers.get("Retry-After", 10))
                 retries += 1
                 if retries > MAX_RETRIES:
-                    print(
-                        f"\n    Upload failed: server returned {r.status_code}")
+                    print(f"\n    Upload failed: server returned {r.status_code}")
                     return False, None
-                print(
-                    f"\n    Server {r.status_code}, retry in {retry_after}s ...")
+                print(f"\n    Server {r.status_code}, retry in {retry_after}s ...")
                 time.sleep(retry_after)
                 try:
                     offset = _query_offset(upload_url, token, file_size)
@@ -301,7 +335,7 @@ _STATE = {
 }
 
 
-def get_video_state(base, token, uuid):
+def get_video_state(base: str, token: str, uuid: str) -> tuple[int, str]:
     r = requests.get(
         f"{base}/api/v1/videos/{uuid}",
         headers=api_headers(token),
@@ -312,7 +346,7 @@ def get_video_state(base, token, uuid):
     return state["id"], state.get("label", "")
 
 
-def wait_for_published(base, token, uuid, poll_interval):
+def wait_for_published(base: str, token: str, uuid: str, poll_interval: int) -> int:
     """Block until the video reaches state 1 (Published) or a failure state."""
     started = time.monotonic()
     while True:
@@ -329,8 +363,10 @@ def wait_for_published(base, token, uuid, poll_interval):
         try:
             sid, label = get_video_state(base, token, uuid)
         except requests.exceptions.RequestException as e:
-            print(f"    -> Poll error ({e.__class__.__name__}) "
-                  f"after {elapsed_str}, retrying in {poll_interval}s …")
+            print(
+                f"    -> Poll error ({e.__class__.__name__}) "
+                f"after {elapsed_str}, retrying in {poll_interval}s …"
+            )
             time.sleep(poll_interval)
             continue
 
@@ -343,13 +379,16 @@ def wait_for_published(base, token, uuid, poll_interval):
             print(f"    -> FAILED: {display}")
             return sid
 
-        print(f"    -> {display} … {elapsed_str} elapsed (next check in {poll_interval}s)")
+        print(
+            f"    -> {display} … {elapsed_str} elapsed (next check in {poll_interval}s)"
+        )
         time.sleep(poll_interval)
 
 
 # ── State tracker ────────────────────────────────────────────────────
 
-def load_uploaded(input_dir):
+
+def load_uploaded(input_dir: str) -> set[Path]:
     path = Path(input_dir) / UPLOADED_FILE
     if not path.exists():
         return set()
@@ -357,36 +396,60 @@ def load_uploaded(input_dir):
         return {Path(line.strip()) for line in f if line.strip()}
 
 
-def mark_uploaded(input_dir, rel_path):
+def mark_uploaded(input_dir: str, rel_path: Path) -> None:
     with open(Path(input_dir) / UPLOADED_FILE, "a") as f:
         f.write(f"{rel_path}\n")
 
 
 # ── File / metadata helpers ─────────────────────────────────────────
 
-def build_path_to_meta(video_map, input_dir):
-    """Map each expected download path (relative) to {title, description}."""
+
+def build_path_to_meta(
+    video_map: dict[str, Any],
+    input_dir: str,
+) -> dict[Path, dict[str, str]]:
+    """Map each expected download path (relative) to {title, description, original_filename}."""
     urls = collect_urls(video_map)
     mode = read_mode(input_dir) or MODE_ORIGINAL
-    paths = get_paths_for_mode(mode, urls, video_map, input_dir)
 
-    url_meta = {}
-    for entry in video_map.values():
-        t = entry.get("title", "")
-        d = entry.get("description", "")
-        for video_url in entry.get("videos", []):
-            if video_url not in url_meta:
-                url_meta[video_url] = {"title": t, "description": d}
+    url_to_site: dict[str, str] = {}
+    for site_key in SITES:
+        for entry in load_video_map(site_key).values():
+            for vid_url in entry.get("videos", []):
+                url_to_site[vid_url] = site_key
 
-    result = {}
+    paths = get_paths_for_mode(mode, urls, video_map, input_dir, url_to_site)
+
+    url_meta: dict[str, dict[str, str]] = {}
+    for entry_any in video_map.values():
+        entry = cast(dict[str, Any], entry_any)
+
+        t = entry.get("title")
+        d = entry.get("description")
+        title = t if isinstance(t, str) else ""
+        desc = d if isinstance(d, str) else ""
+
+        videos_any = entry.get("videos", [])
+        if isinstance(videos_any, list):
+            for video_url_any in videos_any:
+                if not isinstance(video_url_any, str):
+                    continue
+                if video_url_any not in url_meta:
+                    url_meta[video_url_any] = {"title": title, "description": desc}
+
+    result: dict[Path, dict[str, str]] = {}
     for url, abs_path in paths.items():
-        rel = Path(abs_path).relative_to(input_dir)
+        rel = abs_path.relative_to(input_dir)
         meta = url_meta.get(url, {"title": "", "description": ""})
-        result[rel] = {**meta, "original_filename": url_to_filename(url)}
+        result[rel] = {
+            "title": meta.get("title", ""),
+            "description": meta.get("description", ""),
+            "original_filename": url_to_filename(url),
+        }
     return result
 
 
-def find_videos(input_dir):
+def find_videos(input_dir: str) -> set[Path]:
     """Walk input_dir and return a set of relative paths for all video files."""
     found = set()
     for root, dirs, files in os.walk(input_dir):
@@ -399,7 +462,12 @@ def find_videos(input_dir):
 
 # ── Channel match helpers ─────────────────────────────────────────────
 
-def _channel_match(rel, path_meta, existing):
+
+def _channel_match(
+    rel: Path,
+    path_meta: dict[Path, dict[str, str]],
+    existing: set[str],
+) -> tuple[bool, str]:
     """Return (matched, name) for a local file against the channel name set.
 
     Checks both the title-derived name and the original-filename-derived name
@@ -409,52 +477,80 @@ def _channel_match(rel, path_meta, existing):
     """
     meta = path_meta.get(rel, {})
     name = make_pt_name(meta.get("title", ""), rel.name)
+
     orig_fn = meta.get("original_filename", "")
-    raw_name = make_pt_name("", orig_fn) if orig_fn else None
-    matched = name in existing or (raw_name and raw_name != name and raw_name in existing)
+    raw_name: str | None = make_pt_name("", orig_fn) if orig_fn else None
+
+    matched = name in existing
+    if not matched and raw_name is not None and raw_name != name:
+        matched = raw_name in existing
+
     return matched, name
 
 
 # ── CLI ──────────────────────────────────────────────────────────────
 
-def main():
+
+def main() -> None:
     ap = argparse.ArgumentParser(
         description="Upload videos to PeerTube with transcoding-aware batching",
     )
-    ap.add_argument("--input", "-i", default=DEFAULT_OUTPUT,
-                    help=f"Directory with downloaded videos (default: {DEFAULT_OUTPUT})")
-    ap.add_argument("--url",
-                    help="PeerTube instance URL (or set PEERTUBE_URL env var)")
-    ap.add_argument("--username", "-U",
-                    help="PeerTube username (or set PEERTUBE_USER env var)")
-    ap.add_argument("--password", "-p",
-                    help="PeerTube password (or set PEERTUBE_PASSWORD env var)")
-    ap.add_argument("--channel", "-C",
-                    help="Channel to upload to (or set PEERTUBE_CHANNEL env var)")
-    ap.add_argument("--batch-size", "-b", type=int, default=DEFAULT_BATCH_SIZE,
-                    help="Videos to upload before waiting for transcoding (default: 1)")
-    ap.add_argument("--poll-interval", type=int, default=DEFAULT_POLL,
-                    help=f"Seconds between state polls (default: {DEFAULT_POLL})")
-    ap.add_argument("--skip-wait", action="store_true",
-                    help="Upload everything without waiting for transcoding")
-    ap.add_argument("--nsfw", action="store_true",
-                    help="Mark videos as NSFW")
-    ap.add_argument("--dry-run", "-n", action="store_true",
-                    help="Preview what would be uploaded")
+    ap.add_argument(
+        "--input",
+        "-i",
+        default=DEFAULT_OUTPUT,
+        help=f"Directory with downloaded videos (default: {DEFAULT_OUTPUT})",
+    )
+    ap.add_argument("--url", help="PeerTube instance URL (or set PEERTUBE_URL env var)")
+    ap.add_argument(
+        "--username", "-U", help="PeerTube username (or set PEERTUBE_USER env var)"
+    )
+    ap.add_argument(
+        "--password", "-p", help="PeerTube password (or set PEERTUBE_PASSWORD env var)"
+    )
+    ap.add_argument(
+        "--channel", "-C", help="Channel to upload to (or set PEERTUBE_CHANNEL env var)"
+    )
+    ap.add_argument(
+        "--batch-size",
+        "-b",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help="Videos to upload before waiting for transcoding (default: 1)",
+    )
+    ap.add_argument(
+        "--poll-interval",
+        type=int,
+        default=DEFAULT_POLL,
+        help=f"Seconds between state polls (default: {DEFAULT_POLL})",
+    )
+    ap.add_argument(
+        "--skip-wait",
+        action="store_true",
+        help="Upload everything without waiting for transcoding",
+    )
+    ap.add_argument("--nsfw", action="store_true", help="Mark videos as NSFW")
+    ap.add_argument(
+        "--dry-run", "-n", action="store_true", help="Preview what would be uploaded"
+    )
     args = ap.parse_args()
 
-    url      = args.url      or os.environ.get("PEERTUBE_URL")
+    url = args.url or os.environ.get("PEERTUBE_URL")
     username = args.username or os.environ.get("PEERTUBE_USER")
-    channel  = args.channel  or os.environ.get("PEERTUBE_CHANNEL")
+    channel = args.channel or os.environ.get("PEERTUBE_CHANNEL")
     password = args.password or os.environ.get("PEERTUBE_PASSWORD")
 
     if not args.dry_run:
-        missing = [label for label, val in [
-            ("--url / PEERTUBE_URL", url),
-            ("--username / PEERTUBE_USER", username),
-            ("--channel / PEERTUBE_CHANNEL", channel),
-            ("--password / PEERTUBE_PASSWORD", password),
-        ] if not val]
+        missing = [
+            label
+            for label, val in [
+                ("--url / PEERTUBE_URL", url),
+                ("--username / PEERTUBE_USER", username),
+                ("--channel / PEERTUBE_CHANNEL", channel),
+                ("--password / PEERTUBE_PASSWORD", password),
+            ]
+            if not val
+        ]
         if missing:
             for label in missing:
                 print(f"[!] Required: {label}")
@@ -468,7 +564,8 @@ def main():
     unmatched = on_disk - set(path_meta.keys())
     if unmatched:
         print(
-            f"[!] {len(unmatched)} file(s) on disk not in video_map (will use filename as title)")
+            f"[!] {len(unmatched)} file(s) on disk not in video_map (will use filename as title)"
+        )
         for rel in unmatched:
             path_meta[rel] = {"title": "", "description": ""}
 
@@ -493,9 +590,13 @@ def main():
             sz = (Path(args.input) / rel).stat().st_size
             total_bytes += sz
             print(f"  [{fmt_size(sz):>10}]  {name}")
-        print(
-            f"\n  Total: {fmt_size(total_bytes)} across {len(pending)} videos")
+        print(f"\n  Total: {fmt_size(total_bytes)} across {len(pending)} videos")
         return
+
+    assert url is not None
+    assert username is not None
+    assert channel is not None
+    assert password is not None
 
     # ── authenticate ──
     base = url.rstrip("/")
@@ -533,7 +634,9 @@ def main():
         if _channel_match(rel, path_meta, existing)[0]:
             pre_matched.append(rel)
     if pre_matched:
-        print(f"\n[+] Pre-sweep: {len(pre_matched)} local file(s) already on channel — marking uploaded")
+        print(
+            f"\n[+] Pre-sweep: {len(pre_matched)} local file(s) already on channel — marking uploaded"
+        )
         for rel in pre_matched:
             mark_uploaded(args.input, rel)
         pending = [rel for rel in pending if rel not in set(pre_matched)]
@@ -541,14 +644,15 @@ def main():
 
     nsfw = args.nsfw
     total_up = 0
-    batch: list[tuple[str, str]] = []   # [(uuid, name), ...]
+    batch: list[tuple[str, str]] = []  # [(uuid, name), ...]
 
     try:
         for rel in pending:
             # ── flush batch if full ──
             if not args.skip_wait and len(batch) >= args.batch_size:
                 print(
-                    f"\n[+] Waiting for {len(batch)} video(s) to finish processing ...")
+                    f"\n[+] Waiting for {len(batch)} video(s) to finish processing ..."
+                )
                 for uuid, bname in batch:
                     print(f"\n  [{bname}]")
                     wait_for_published(base, token, uuid, args.poll_interval)
@@ -568,18 +672,19 @@ def main():
             print(f"\n[{total_up + 1}/{len(pending)}] {name}")
             print(f"    File: {rel}  ({fmt_size(sz)})")
 
-            ok, uuid = upload_video(
-                base, token, channel_id, filepath, name, desc, nsfw)
+            ok, uuid_opt = upload_video(
+                base, token, channel_id, filepath, name, desc, nsfw
+            )
             if not ok:
                 continue
 
-            print(f"    Uploaded  uuid={uuid}")
+            print(f"    Uploaded  uuid={uuid_opt}")
             mark_uploaded(args.input, rel)
             total_up += 1
             existing.add(name)
 
-            if uuid:
-                batch.append((uuid, name))
+            if uuid_opt is not None:
+                batch.append((uuid_opt, name))
 
         # ── wait for final batch ──
         if batch and not args.skip_wait:
@@ -589,8 +694,7 @@ def main():
                 wait_for_published(base, token, uuid, args.poll_interval)
 
     except KeyboardInterrupt:
-        print(
-            f"\n\n[!] Interrupted after {total_up} uploads. Re-run to continue.")
+        print(f"\n\n[!] Interrupted after {total_up} uploads. Re-run to continue.")
         sys.exit(130)
 
     print(f"\n{'=' * 50}")

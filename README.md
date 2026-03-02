@@ -128,10 +128,11 @@ Lists filenames that map to more than one source URL, with sizes.
 ### Estimate total download size
 
 ```bash
-python total_size.py
+python total_size.py           # read cached sizes and print summary
+python total_size.py --write   # probe uncached/stale URLs and refresh the cache
 ```
 
-Fetches `Content-Length` for every video URL in `video_map.json` and prints a size summary. Does not download anything.
+Reads cached file sizes from `video_map.json` and prints a summary (total, smallest, largest, average). The default mode never hits the network. Use `--write` to probe any missing or stale entries and persist the results.
 
 ## Data files
 

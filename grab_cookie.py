@@ -14,10 +14,12 @@ import os
 from pathlib import Path
 from typing import Literal
 import requests
+from dotenv import load_dotenv
 from config import SITES
 
 ENV_FILE = Path(".env")
 COOKIE_PREFIX = "wordpress_logged_in_"
+load_dotenv(dotenv_path=ENV_FILE)
 
 
 def update_env(
@@ -72,6 +74,9 @@ def login_and_get_cookie(
             "Referer": f"{base_url}/",
             "Origin": base_url,
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "*/*",
         },
         timeout=30,
     )

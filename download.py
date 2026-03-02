@@ -18,6 +18,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 import requests
+import time
 
 from check_clashes import (
     make_session,
@@ -28,6 +29,7 @@ from check_clashes import (
     build_url_referers,
     fetch_sizes,
     load_video_map,
+    save_video_map,
     is_valid_url,
     VIDEO_MAP_FILE,
 )
@@ -288,6 +290,25 @@ def build_url_title_map(video_map: dict[str, Any]) -> dict[str, str]:
     return url_title
 
 
+def _persist_fetched_sizes(newly_fetched: dict[str, int | None]) -> None:
+    """Write newly probed sizes back to video_map.json (successful probes only)."""
+    now = int(time.time())
+    for site_key in SITES:
+        vm_site = load_video_map(site_key)
+        changed = False
+        for entry in vm_site.values():
+            for vid in entry.get("videos", []):
+                if vid["url"] in newly_fetched and vid.get("size") is None and newly_fetched[vid["url"]] is not None:
+                    vid["size"] = newly_fetched[vid["url"]]
+                    vid["size_checked_at"] = now
+                    changed = True
+        if changed:
+            save_video_map(vm_site, site_key)
+    n_saved = sum(1 for s in newly_fetched.values() if s is not None)
+    if n_saved:
+        print(f"[+] Cached {n_saved} newly probed size(s).")
+
+
 def build_url_to_site() -> dict[str, str]:
     """Return {cdn_video_url: site_key} by loading each site's map in turn."""
     result: dict[str, str] = {}
@@ -423,16 +444,16 @@ def main() -> None:
         if vid.get("size") is not None
     }
 
+    newly_fetched: dict[str, int | None] = {}
     uncached_pending = [u for u in pending if u not in cached_sizes]
     session = make_session()
     if uncached_pending:
         print(
             f"\n[+] Fetching remote file sizes ({len(uncached_pending)} uncached, {len(pending) - len(uncached_pending)} cached)…"
         )
-        remote_sizes: dict[str, int | None] = {
-            **cached_sizes,
-            **fetch_sizes(uncached_pending, workers=20, url_referers=url_referers),
-        }
+        fetched_pending = fetch_sizes(uncached_pending, workers=20, url_referers=url_referers)
+        newly_fetched.update(fetched_pending)
+        remote_sizes: dict[str, int | None] = {**cached_sizes, **fetched_pending}
     else:
         print(f"\n[+] All {len(pending)} pending sizes cached — skipping probe.")
         remote_sizes = dict(cached_sizes)
@@ -447,10 +468,9 @@ def main() -> None:
             print(
                 f"[+] Verifying {len(already)} existing files ({len(uncached_already)} uncached)…"
             )
-            already_sizes: dict[str, int | None] = {
-                **cached_sizes,
-                **fetch_sizes(uncached_already, workers=20, url_referers=url_referers),
-            }
+            fetched_already = fetch_sizes(uncached_already, workers=20, url_referers=url_referers)
+            newly_fetched.update(fetched_already)
+            already_sizes: dict[str, int | None] = {**cached_sizes, **fetched_already}
         else:
             print(f"[+] Verifying {len(already)} existing files (all sizes cached)…")
             already_sizes = dict(cached_sizes)
@@ -471,6 +491,9 @@ def main() -> None:
 
     if mismatched:
         print(f"[!] {mismatched} file(s) will be re-downloaded due to size mismatch")
+
+    if newly_fetched:
+        _persist_fetched_sizes(newly_fetched)
 
     print(f"\n[⚡] Downloading with {args.workers} threads…\n")
 

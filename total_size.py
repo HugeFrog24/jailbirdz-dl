@@ -59,7 +59,7 @@ def _is_stale(vid: dict[str, Any], now: int) -> bool:
     """True if the cached size is absent or older than SIZE_CACHE_TTL seconds."""
     if vid.get("size") is None:
         return True
-    return (now - vid.get("size_checked_at", 0)) >= SIZE_CACHE_TTL
+    return (now - int(vid.get("size_checked_at", 0))) >= SIZE_CACHE_TTL
 
 
 # --------------- CLI ---------------

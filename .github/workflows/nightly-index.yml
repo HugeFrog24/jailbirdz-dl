@@ -1,0 +1,49 @@
+name: Nightly Index
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # 03:00 UTC daily
+  workflow_dispatch:      # manual trigger via GitHub UI
+
+permissions:
+  contents: write         # needed to push video_map.json back
+
+concurrency:
+  group: nightly-index
+  cancel-in-progress: false  # let an in-progress scrape finish; queue the next run
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300  # 5 h ceiling; scraper resumes where it left off on next run
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright Firefox
+        run: playwright install firefox --with-deps
+
+      - name: Run scraper
+        run: python main.py
+        env:
+          JAILBIRDZ_USERNAME: ${{ secrets.JAILBIRDZ_USERNAME }}
+          JAILBIRDZ_PASSWORD: ${{ secrets.JAILBIRDZ_PASSWORD }}
+          PINKCUFFS_USERNAME: ${{ secrets.PINKCUFFS_USERNAME }}
+          PINKCUFFS_PASSWORD: ${{ secrets.PINKCUFFS_PASSWORD }}
+
+      - name: Commit updated video_map.json
+        if: always()  # save progress even if main.py crashed or timed out
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add video_map.json
+          git diff --staged --quiet || git commit -m "chore: nightly index update [skip ci]"
+          git push

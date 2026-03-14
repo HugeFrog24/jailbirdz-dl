@@ -11,12 +11,14 @@ Usage:
 """
 
 import argparse
-import json
 from pathlib import Path
 import re
 import shutil
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
+import requests
+import time
 
 from check_clashes import (
     make_session,
@@ -24,33 +26,39 @@ from check_clashes import (
     url_to_filename,
     find_clashes,
     build_download_paths,
+    build_url_referers,
     fetch_sizes,
+    load_video_map,
+    save_video_map,
+    is_valid_url,
+    VIDEO_MAP_FILE,
 )
+from config import SITES
 
-VIDEO_MAP_FILE = "video_map.json"
 CHUNK_SIZE = 8 * 1024 * 1024
-DEFAULT_OUTPUT = "downloads"
-DEFAULT_WORKERS = 4
-MODE_FILE = ".naming_mode"
-MODE_ORIGINAL = "original"
-MODE_TITLE = "title"
+DEFAULT_OUTPUT: str = "downloads"
+DEFAULT_WORKERS: int = 4
+MODE_FILE: str = ".naming_mode"
+MODE_ORIGINAL: str = "original"
+MODE_TITLE: str = "title"
 
 
 # ── Naming mode persistence ──────────────────────────────────────────
 
-def read_mode(output_dir):
+
+def read_mode(output_dir: str | Path) -> str | None:
     p = Path(output_dir) / MODE_FILE
     if p.exists():
         return p.read_text().strip()
     return None
 
 
-def write_mode(output_dir, mode):
+def write_mode(output_dir: str | Path, mode: str) -> None:
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     (Path(output_dir) / MODE_FILE).write_text(mode)
 
 
-def resolve_mode(args):
+def resolve_mode(args: argparse.Namespace) -> str:
     """Determine naming mode from CLI flags + saved marker. Returns mode string."""
     saved = read_mode(args.output)
 
@@ -69,13 +77,18 @@ def resolve_mode(args):
 
 # ── Filename helpers ─────────────────────────────────────────────────
 
-def sanitize_filename(title, max_len=180):
-    name = re.sub(r'[<>:"/\\|?*]', '', title)
-    name = re.sub(r'\s+', ' ', name).strip().rstrip('.')
+
+def sanitize_filename(title: str, max_len: int = 180) -> str:
+    name = re.sub(r'[<>:"/\\|?*]', "", title)
+    name = re.sub(r"\s+", " ", name).strip().rstrip(".")
     return name[:max_len].rstrip() if len(name) > max_len else name
 
 
-def build_title_paths(urls, url_to_title, output_dir):
+def build_title_paths(
+    urls: list[str],
+    url_to_title: dict[str, str],
+    output_dir: str | Path,
+) -> dict[str, Path]:
     name_to_urls = defaultdict(list)
     url_to_base = {}
 
@@ -91,14 +104,33 @@ def build_title_paths(urls, url_to_title, output_dir):
         base, ext = url_to_base[url]
         full = base + ext
         if len(name_to_urls[full]) > 1:
-            slug = url_to_filename(url).rsplit('.', 1)[0]
+            slug = url_to_filename(url).rsplit(".", 1)[0]
             paths[url] = Path(output_dir) / f"{base} [{slug}]{ext}"
         else:
             paths[url] = Path(output_dir) / full
     return paths
 
 
-def get_paths_for_mode(mode, urls, video_map, output_dir):
+def get_paths_for_mode(
+    mode: str,
+    urls: list[str],
+    video_map: dict[str, Any],
+    output_dir: str | Path,
+    url_to_site: dict[str, str] | None = None,
+) -> dict[str, Path]:
+    if url_to_site:
+        by_site: dict[str, list[str]] = defaultdict(list)
+        for u in urls:
+            by_site[url_to_site.get(u, "")].append(u)
+        paths: dict[str, Path] = {}
+        url_title = build_url_title_map(video_map) if mode == MODE_TITLE else {}
+        for site, site_urls in by_site.items():
+            base = Path(output_dir) / site if site else Path(output_dir)
+            if mode == MODE_TITLE:
+                paths.update(build_title_paths(site_urls, url_title, base))
+            else:
+                paths.update(build_download_paths(site_urls, base))
+        return paths
     if mode == MODE_TITLE:
         url_title = build_url_title_map(video_map)
         return build_title_paths(urls, url_title, output_dir)
@@ -107,11 +139,21 @@ def get_paths_for_mode(mode, urls, video_map, output_dir):
 
 # ── Reorganize ───────────────────────────────────────────────────────
 
-def reorganize(urls, video_map, output_dir, target_mode, dry_run=False):
+
+def reorganize(
+    urls: list[str],
+    video_map: dict[str, Any],
+    output_dir: str | Path,
+    target_mode: str,
+    dry_run: bool = False,
+    url_to_site: dict[str, str] | None = None,
+) -> None:
     """Rename existing files from one naming scheme to another."""
     other_mode = MODE_TITLE if target_mode == MODE_ORIGINAL else MODE_ORIGINAL
-    old_paths = get_paths_for_mode(other_mode, urls, video_map, output_dir)
-    new_paths = get_paths_for_mode(target_mode, urls, video_map, output_dir)
+    old_paths = get_paths_for_mode(other_mode, urls, video_map, output_dir, url_to_site)
+    new_paths = get_paths_for_mode(
+        target_mode, urls, video_map, output_dir, url_to_site
+    )
 
     moves = []
     for url in urls:
@@ -163,21 +205,30 @@ def reorganize(urls, video_map, output_dir, target_mode, dry_run=False):
 
 # ── Download ─────────────────────────────────────────────────────────
 
-def download_one(session, url, dest, expected_size):
+
+def download_one(
+    session: requests.Session,
+    url: str,
+    dest: str | Path,
+    expected_size: int | None,
+    referer: str = "",
+) -> tuple[str, int]:
     dest = Path(dest)
     part = dest.parent / (dest.name + ".part")
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     if dest.exists():
         local = dest.stat().st_size
-        if expected_size and local == expected_size:
+        if expected_size is not None and local == expected_size:
             return "ok", 0
-        if expected_size and local != expected_size:
+        if expected_size is not None and local != expected_size:
             dest.unlink()
 
     existing = part.stat().st_size if part.exists() else 0
-    headers = {}
-    if existing and expected_size and existing < expected_size:
+    headers: dict[str, str] = {}
+    if referer:
+        headers["Referer"] = referer
+    if existing and expected_size is not None and existing < expected_size:
         headers["Range"] = f"bytes={existing}-"
 
     try:
@@ -205,34 +256,23 @@ def download_one(session, url, dest, expected_size):
         return f"error: {e}", written
 
     final_size = existing + written
-    if expected_size and final_size != expected_size:
+    if expected_size is not None and final_size != expected_size:
         return "size_mismatch", written
 
     part.rename(dest)
     return "ok", written
 
 
-# ── Data loading ─────────────────────────────────────────────────────
-
-def load_video_map():
-    with open(VIDEO_MAP_FILE, encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _is_valid_url(url):
-    return url.startswith(
-        "http") and "<" not in url and ">" not in url and " href=" not in url
-
-
-def collect_urls(video_map):
+def collect_urls(video_map: dict[str, Any]) -> list[str]:
     urls, seen, skipped = [], set(), 0
     for entry in video_map.values():
-        for video_url in entry.get("videos", []):
-            if video_url in seen:
+        for vid in entry.get("videos", []):
+            u = vid["url"]
+            if u in seen:
                 continue
-            seen.add(video_url)
-            if _is_valid_url(video_url):
-                urls.append(video_url)
+            seen.add(u)
+            if is_valid_url(u):
+                urls.append(u)
             else:
                 skipped += 1
     if skipped:
@@ -240,40 +280,105 @@ def collect_urls(video_map):
     return urls
 
 
-def build_url_title_map(video_map):
+def build_url_title_map(video_map: dict[str, Any]) -> dict[str, str]:
     url_title = {}
     for entry in video_map.values():
         title = entry.get("title", "")
-        for video_url in entry.get("videos", []):
-            if video_url not in url_title:
-                url_title[video_url] = title
+        for vid in entry.get("videos", []):
+            if vid["url"] not in url_title:
+                url_title[vid["url"]] = title
     return url_title
+
+
+def _persist_fetched_sizes(newly_fetched: dict[str, int | None]) -> None:
+    """Write newly probed sizes back to video_map.json (successful probes only)."""
+    now = int(time.time())
+    for site_key in SITES:
+        vm_site = load_video_map(site_key)
+        changed = False
+        for entry in vm_site.values():
+            for vid in entry.get("videos", []):
+                if vid["url"] in newly_fetched and vid.get("size") is None and newly_fetched[vid["url"]] is not None:
+                    vid["size"] = newly_fetched[vid["url"]]
+                    vid["size_checked_at"] = now
+                    changed = True
+        if changed:
+            save_video_map(vm_site, site_key)
+    n_saved = sum(1 for s in newly_fetched.values() if s is not None)
+    if n_saved:
+        print(f"[+] Cached {n_saved} newly probed size(s).")
+
+
+def build_url_to_site() -> dict[str, str]:
+    """Return {cdn_video_url: site_key} by loading each site's map in turn."""
+    result: dict[str, str] = {}
+    for site_key in SITES:
+        for entry in load_video_map(site_key).values():
+            for vid in entry.get("videos", []):
+                result[vid["url"]] = site_key
+    return result
 
 
 # ── Main ─────────────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Download videos from video_map.json")
-    parser.add_argument("--output", "-o", default=DEFAULT_OUTPUT,
-                        help=f"Download directory (default: {DEFAULT_OUTPUT})")
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Download videos from video_map.json")
+    parser.add_argument(
+        "--output",
+        "-o",
+        default=DEFAULT_OUTPUT,
+        help=f"Download directory (default: {DEFAULT_OUTPUT})",
+    )
 
     naming = parser.add_mutually_exclusive_group()
-    naming.add_argument("--titles", "-t", action="store_true",
-                        help="Use title-based filenames (saved as default for this directory)")
-    naming.add_argument("--original", action="store_true",
-                        help="Use original CloudFront filenames (saved as default for this directory)")
+    naming.add_argument(
+        "--titles",
+        "-t",
+        action="store_true",
+        help="Use title-based filenames (saved as default for this directory)",
+    )
+    naming.add_argument(
+        "--original",
+        action="store_true",
+        help="Use original CloudFront filenames (saved as default for this directory)",
+    )
 
-    parser.add_argument("--reorganize", action="store_true",
-                        help="Rename existing files to match the current naming mode")
-    parser.add_argument("--dry-run", "-n", action="store_true",
-                        help="Preview without making changes")
-    parser.add_argument("--workers", "-w", type=int, default=DEFAULT_WORKERS,
-                        help=f"Concurrent downloads (default: {DEFAULT_WORKERS})")
+    parser.add_argument(
+        "--reorganize",
+        action="store_true",
+        help="Rename existing files to match the current naming mode",
+    )
+    parser.add_argument(
+        "--dry-run", "-n", action="store_true", help="Preview without making changes"
+    )
+    parser.add_argument(
+        "--workers",
+        "-w",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f"Concurrent downloads (default: {DEFAULT_WORKERS})",
+    )
+    parser.add_argument(
+        "--site",
+        action="append",
+        choices=list(SITES.keys()),
+        dest="sites",
+        metavar="SITE",
+        help=f"Site(s) to download (default: all). Can be repeated. Choices: {', '.join(SITES)}",
+    )
     args = parser.parse_args()
 
     video_map = load_video_map()
+    url_referers = build_url_referers(video_map)
     urls = collect_urls(video_map)
+
+    url_to_site = build_url_to_site()
+
+    if args.sites:
+        selected = set(args.sites)
+        urls = [u for u in urls if url_to_site.get(u) in selected]
+
     mode = resolve_mode(args)
 
     saved = read_mode(args.output)
@@ -287,10 +392,18 @@ def main():
         if mode_changed and not args.reorganize:
             print(f"\n[!] Mode changed from '{saved}' to '{mode}'.")
             print(
-                "    Use --reorganize to rename existing files, or --dry-run to preview.")
+                "    Use --reorganize to rename existing files, or --dry-run to preview."
+            )
             print("    Refusing to download until existing files are reorganized.")
             return
-        reorganize(urls, video_map, args.output, mode, dry_run=args.dry_run)
+        reorganize(
+            urls,
+            video_map,
+            args.output,
+            mode,
+            dry_run=args.dry_run,
+            url_to_site=url_to_site,
+        )
         if args.dry_run or args.reorganize:
             return
 
@@ -298,12 +411,13 @@ def main():
     if not args.dry_run:
         write_mode(args.output, mode)
 
-    paths = get_paths_for_mode(mode, urls, video_map, args.output)
+    paths = get_paths_for_mode(mode, urls, video_map, args.output, url_to_site)
 
     clashes = find_clashes(urls)
     if clashes:
         print(
-            f"[+] {len(clashes)} filename clash(es) resolved with subfolders/suffixes")
+            f"[+] {len(clashes)} filename clash(es) resolved with subfolders/suffixes"
+        )
 
     already = [u for u in urls if paths[u].exists()]
     pending = [u for u in urls if not paths[u].exists()]
@@ -316,26 +430,50 @@ def main():
         return
 
     if args.dry_run:
-        print(
-            f"\n[dry-run] Would download {len(pending)} files to {args.output}/")
+        print(f"\n[dry-run] Would download {len(pending)} files to {args.output}/")
         for url in pending[:20]:
             print(f"  → {paths[url].name}")
         if len(pending) > 20:
             print(f"  … and {len(pending) - 20} more")
         return
 
-    print("\n[+] Fetching remote file sizes…")
+    cached_sizes: dict[str, int] = {
+        vid["url"]: vid["size"]
+        for entry in video_map.values()
+        for vid in entry.get("videos", [])
+        if vid.get("size") is not None
+    }
+
+    newly_fetched: dict[str, int | None] = {}
+    uncached_pending = [u for u in pending if u not in cached_sizes]
     session = make_session()
-    remote_sizes = fetch_sizes(pending, workers=20)
+    if uncached_pending:
+        print(
+            f"\n[+] Fetching remote file sizes ({len(uncached_pending)} uncached, {len(pending) - len(uncached_pending)} cached)…"
+        )
+        fetched_pending = fetch_sizes(uncached_pending, workers=20, url_referers=url_referers)
+        newly_fetched.update(fetched_pending)
+        remote_sizes: dict[str, int | None] = {**cached_sizes, **fetched_pending}
+    else:
+        print(f"\n[+] All {len(pending)} pending sizes cached — skipping probe.")
+        remote_sizes = dict(cached_sizes)
 
     sized = {u: s for u, s in remote_sizes.items() if s is not None}
     total_bytes = sum(sized.values())
-    print(
-        f"[+] Download size: {fmt_size(total_bytes)} across {len(pending)} files")
+    print(f"[+] Download size: {fmt_size(total_bytes)} across {len(pending)} files")
 
     if already:
-        print(f"[+] Verifying {len(already)} existing files…")
-        already_sizes = fetch_sizes(already, workers=20)
+        uncached_already = [u for u in already if u not in cached_sizes]
+        if uncached_already:
+            print(
+                f"[+] Verifying {len(already)} existing files ({len(uncached_already)} uncached)…"
+            )
+            fetched_already = fetch_sizes(uncached_already, workers=20, url_referers=url_referers)
+            newly_fetched.update(fetched_already)
+            already_sizes: dict[str, int | None] = {**cached_sizes, **fetched_already}
+        else:
+            print(f"[+] Verifying {len(already)} existing files (all sizes cached)…")
+            already_sizes = dict(cached_sizes)
 
     mismatched = 0
     for url in already:
@@ -344,14 +482,18 @@ def main():
         remote = already_sizes.get(url)
         if remote and local != remote:
             mismatched += 1
-            print(f"[!] Size mismatch: {dest.name} "
-                  f"(local {fmt_size(local)} vs remote {fmt_size(remote)})")
+            print(
+                f"[!] Size mismatch: {dest.name} "
+                f"(local {fmt_size(local)} vs remote {fmt_size(remote)})"
+            )
             pending.append(url)
             remote_sizes[url] = remote
 
     if mismatched:
-        print(
-            f"[!] {mismatched} file(s) will be re-downloaded due to size mismatch")
+        print(f"[!] {mismatched} file(s) will be re-downloaded due to size mismatch")
+
+    if newly_fetched:
+        _persist_fetched_sizes(newly_fetched)
 
     print(f"\n[⚡] Downloading with {args.workers} threads…\n")
 
@@ -361,10 +503,12 @@ def main():
     total = len(pending)
     interrupted = False
 
-    def do_download(url):
+    def do_download(url: str) -> tuple[str, tuple[str, int]]:
         dest = paths[url]
         expected = remote_sizes.get(url)
-        return url, download_one(session, url, dest, expected)
+        return url, download_one(
+            session, url, dest, expected, url_referers.get(url, "")
+        )
 
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
@@ -376,11 +520,9 @@ def main():
                 name = paths[url].name
 
                 if status == "ok" and written > 0:
-                    print(
-                        f"  [{completed}/{total}] ✓ {name} ({fmt_size(written)})")
+                    print(f"  [{completed}/{total}] ✓ {name} ({fmt_size(written)})")
                 elif status == "ok":
-                    print(
-                        f"  [{completed}/{total}] ✓ {name} (already complete)")
+                    print(f"  [{completed}/{total}] ✓ {name} (already complete)")
                 elif status == "size_mismatch":
                     print(f"  [{completed}/{total}] ⚠ {name} (size mismatch)")
                     failed.append(url)

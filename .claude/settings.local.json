@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(jq -r \".\"\"/api/v1/video-channels/{channelHandle}/videos\"\".get.parameters[] | $ref\")",
+      "Bash(grep '$ref')",
+      "Bash(grep -c \"^    ''/\" /c/Users/admin/Desktop/jailbirdz-dl/docs/external/peertube/openapi.yaml)",
+      "Bash(grep -c '    \"\"/' /c/Users/admin/Desktop/jailbirdz-dl/docs/external/peertube/openapi.json)",
+      "Bash(grep -c \"^  ''/\" /c/Users/admin/Desktop/jailbirdz-dl/docs/external/peertube/openapi.yaml)",
+      "Bash(git --no-pager diff HEAD~1 docs/external/peertube/openapi.json)",
+      "Bash(git --no-pager show HEAD~1:docs/external/peertube/openapi.json)",
+      "Bash(git --no-pager diff --name-only HEAD~1)"
+    ]
+  }
+}

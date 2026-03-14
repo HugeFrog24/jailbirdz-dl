@@ -1,6 +1,6 @@
 # 𝒥𝒶𝒾𝓁𝒷𝒾𝓇𝒹𝓏-𝒹𝓁
 
-Jailbirdz.com is an Arizona-based subscription video site publishing arrest and jail roleplay scenarios featuring women. This tool scrapes the member area, downloads the videos, and re-hosts them on a self-owned PeerTube instance.
+Jailbirdz.com and Pinkcuffs.com are Arizona-based subscription video sites publishing arrest and jail roleplay scenarios featuring women. This tool scrapes the member area of one or both sites, downloads the videos, and re-hosts them on a self-owned PeerTube instance.
 
 > [!NOTE]  
 > This tool does not bypass authentication, modify the site, or intercept anything it isn't entitled to. A valid, paid membership is required. The scraper authenticates using your own session cookie and accesses only content your account can already view in a browser.
@@ -19,23 +19,22 @@ Jailbirdz.com is an Arizona-based subscription video site publishing arrest and 
 cp .env.example .env
 ```
 
-### WP_LOGIN_COOKIE
+### Credentials
 
-You need to be logged into jailbirdz.com in a browser. Then either:
+Set credentials for whichever sites you have a membership on. You don't need both.
 
-**Option A — auto (recommended):** let `grab_cookie.py` read it from your browser and write it to `.env` automatically:
+**Option A — credentials (recommended):** set `JAILBIRDZ_USERNAME` + `JAILBIRDZ_PASSWORD` (and/or the `PINKCUFFS_*` equivalents) in `.env`. `main.py` logs in automatically on startup.
 
-```bash
-python grab_cookie.py              # tries Firefox, Chrome, Edge, Brave in order
-python grab_cookie.py -b firefox   # or target a specific browser
-```
+**Option B — manual cookie:** set `JAILBIRDZ_LOGIN_COOKIE` (and/or `PINKCUFFS_LOGIN_COOKIE`) yourself. Get the value from browser DevTools → Storage → Cookies — copy the full `name=value` of the `wordpress_logged_in_*` cookie.
 
-> **Note:** Chrome and Edge on Windows 130+ require the script to run as Administrator due to App-bound Encryption. Firefox works without elevated privileges.
+Sites with no credentials are skipped automatically when running `python main.py`.
 
-**Option B — manual:** open `.env` and set `WP_LOGIN_COOKIE` yourself. Get the value from browser DevTools → Storage → Cookies while on jailbirdz.com — copy the full `name=value` of the `wordpress_logged_in_*` cookie.
+### `.env` values
 
-### Other `.env` values
-
+- `JAILBIRDZ_USERNAME` / `JAILBIRDZ_PASSWORD` — jailbirdz.com login.
+- `JAILBIRDZ_LOGIN_COOKIE` — jailbirdz.com session cookie (fallback).
+- `PINKCUFFS_USERNAME` / `PINKCUFFS_PASSWORD` — pinkcuffs.com login.
+- `PINKCUFFS_LOGIN_COOKIE` — pinkcuffs.com session cookie (fallback).
 - `PEERTUBE_URL` — base URL of your PeerTube instance.
 - `PEERTUBE_USER` — PeerTube username.
 - `PEERTUBE_CHANNEL` — channel to upload to.
@@ -48,7 +47,9 @@ python grab_cookie.py -b firefox   # or target a specific browser
 Discovers all post URLs via the WordPress REST API, then visits each page with a headless Firefox browser to intercept video network requests (MP4, MOV, WebM, AVI, M4V).
 
 ```bash
-python main.py
+python main.py                    # scrape all sites you have credentials for
+python main.py --site jailbirdz   # scrape one site only
+python main.py --site pinkcuffs --site jailbirdz  # explicit multi-site
 ```
 
 Results are written to `video_map.json`. Safe to re-run — already-scraped posts are skipped.
@@ -65,6 +66,7 @@ Options:
       --reorganize      Rename existing files to match current naming mode
   -w, --workers N       Concurrent downloads (default: 4)
   -n, --dry-run         Print what would be downloaded
+      --site SITE       Limit to one site (jailbirdz or pinkcuffs); repeatable
 ```
 
 Resumes partial downloads. The chosen naming mode is saved to `.naming_mode` inside the output directory and persists across runs. Filenames that would clash are placed into subfolders.
@@ -89,6 +91,30 @@ Options:
 
 Uploads in resumable 10 MB chunks. After each batch, waits for transcoding and object storage to complete before uploading the next batch — this prevents disk exhaustion on the PeerTube server. Videos already present on the channel (matched by name) are skipped. Progress is tracked in `.uploaded` inside the input directory.
 
+## CI / Nightly Indexing
+
+`.github/workflows/nightly-index.yml` runs `main.py` at 03:00 UTC daily and commits any new `video_map.json` entries back to the repo.
+
+**One-time setup — add repo secrets for each site you have a membership on:**
+
+```bash
+# jailbirdz (if you have a membership)
+gh secret set JAILBIRDZ_USERNAME
+gh secret set JAILBIRDZ_PASSWORD
+
+# pinkcuffs (if you have a membership)
+gh secret set PINKCUFFS_USERNAME
+gh secret set PINKCUFFS_PASSWORD
+```
+
+**Seed CI with your current progress before the first run:**
+
+```bash
+git add video_map.json && git commit -m "chore: seed video_map"
+```
+
+**Trigger manually:** Actions → Nightly Index → Run workflow.
+
 ## Utilities
 
 ### Check for filename clashes
@@ -102,10 +128,11 @@ Lists filenames that map to more than one source URL, with sizes.
 ### Estimate total download size
 
 ```bash
-python total_size.py
+python total_size.py           # read cached sizes and print summary
+python total_size.py --write   # probe uncached/stale URLs and refresh the cache
 ```
 
-Fetches `Content-Length` for every video URL in `video_map.json` and prints a size summary. Does not download anything.
+Reads cached file sizes from `video_map.json` and prints a summary (total, smallest, largest, average). The default mode never hits the network. Use `--write` to probe any missing or stale entries and persist the results.
 
 ## Data files
 

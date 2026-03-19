@@ -335,6 +335,46 @@ def extract_title_from_html(html: str) -> str | None:
     return None
 
 
+def _is_bunny_playlist(url: str) -> bool:
+    """True if url is the root Bunny.net HLS playlist (not a sub-playlist)."""
+    parsed = urlparse(url)
+    return (
+        parsed.netloc.endswith(".b-cdn.net")
+        and parsed.path.endswith("/playlist.m3u8")
+    )
+
+
+def _is_bunny_junk(url: str) -> bool:
+    """True if url is a Bunny.net CDN init segment (not a usable video URL)."""
+    parsed = urlparse(url)
+    return parsed.netloc.endswith(".b-cdn.net") and PurePosixPath(
+        parsed.path
+    ).name in {"init.mp4", "init.dmp4"}
+
+
+def extract_bunny_embed_url(html: str) -> str | None:
+    """Return a tokenless Bunny.net embed URL found in an iframe, or None."""
+    m = re.search(
+        r'<iframe[^>]+src="(https://player\.mediadelivery\.net/embed/[^"?]+)',
+        html,
+    )
+    return m.group(1) if m else None
+
+
+def _clear_junk_video_entries(video_map: dict[str, Any], site_key: str) -> int:
+    """Reset entries whose only stored videos are CDN init segments. Returns count fixed."""
+    cleared = 0
+    for entry in video_map.values():
+        videos = entry.get("videos", [])
+        if videos and all(_is_bunny_junk(v["url"]) for v in videos):
+            entry["videos"] = []
+            entry.pop("scraped_at", None)
+            cleared += 1
+    if cleared:
+        save_video_map(video_map, site_key)
+    return cleared
+
+
 MAX_RETRIES = 2
 
 
@@ -361,7 +401,9 @@ async def worker(
 
     page.on(
         "response",
-        lambda resp: video_hits.add(resp.url) if _is_video_url(resp.url) else None,
+        lambda resp: video_hits.add(resp.url)
+        if (_is_video_url(resp.url) or _is_bunny_playlist(resp.url))
+        else None,
     )
 
     try:
@@ -376,7 +418,7 @@ async def worker(
             print(f"[W{worker_id}] ({idx + 1}/{total}) {url}{label}")
 
             try:
-                await page.goto(url, wait_until="networkidle", timeout=60000)
+                await page.goto(url, wait_until="load", timeout=60000)
             except Exception as e:
                 print(f"[W{worker_id}] Navigation error: {e}")
                 if expects_video(url) and attempt < MAX_RETRIES:
@@ -451,18 +493,29 @@ async def worker(
             found = set(html_videos) | set(video_hits)
             video_hits.clear()
 
+            print(f"[W{worker_id}] network hits raw: {found or '(empty)'}")
+
             all_videos = [
                 m
                 for m in found
                 if is_valid_url(m)
+                and not _is_bunny_junk(m)
                 and m
                 not in (
                     f"{base_url}/wp-content/plugins/easy-video-player/lib/blank.mp4",
                 )
             ]
 
+            if not all_videos:
+                embed_url = extract_bunny_embed_url(html)
+                if embed_url:
+                    print(
+                        f"[W{worker_id}] No network hit — iframe fallback: {embed_url}"
+                    )
+                    all_videos = [embed_url]
+
             async with map_lock:
-                new_found = found - known
+                new_found = set(all_videos) - known
                 if new_found:
                     print(f"[W{worker_id}] Found {len(new_found)} new video URLs")
                     known.update(new_found)
@@ -519,6 +572,12 @@ async def run_for_site(
     urls = load_post_urls(site_key, base_url, wp_api, req_headers)
 
     video_map = load_video_map(site_key)
+    junk_cleared = _clear_junk_video_entries(video_map, site_key)
+    if junk_cleared:
+        print(
+            f"[{site_key}] Cleared {junk_cleared} entries with junk CDN init segments — will re-scrape."
+        )
+
     if any(
         u not in video_map
         or not video_map[u].get("title")

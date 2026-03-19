@@ -14,6 +14,8 @@ import argparse
 from pathlib import Path
 import re
 import shutil
+import subprocess
+import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
@@ -31,6 +33,7 @@ from check_clashes import (
     load_video_map,
     save_video_map,
     is_valid_url,
+    is_hls_url,
     VIDEO_MAP_FILE,
 )
 from config import SITES
@@ -204,6 +207,30 @@ def reorganize(
 
 
 # ── Download ─────────────────────────────────────────────────────────
+
+
+def download_hls(url: str, dest: Path, referer: str = "") -> tuple[str, int]:
+    """Download an HLS stream via yt-dlp. Returns (status, bytes_written)."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        return "ok", 0
+    cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "--quiet", "--no-warnings",
+        "--referer", referer or "https://player.mediadelivery.net/",
+        "-o", str(dest),
+        url,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            lines = (proc.stderr or proc.stdout).strip().splitlines()
+            return f"error: {lines[-1] if lines else 'yt-dlp failed'}", 0
+        if not dest.exists():
+            return "error: output file missing after yt-dlp", 0
+        return "ok", dest.stat().st_size
+    except Exception as e:
+        return f"error: {e}", 0
 
 
 def download_one(
@@ -384,7 +411,7 @@ def main() -> None:
     saved = read_mode(args.output)
     mode_changed = saved is not None and saved != mode
 
-    print(f"[+] {len(urls)} MP4 URLs from {VIDEO_MAP_FILE}")
+    print(f"[+] {len(urls)} video URLs from {VIDEO_MAP_FILE}")
     print(f"[+] Naming mode: {mode}" + (" (changed!)" if mode_changed else ""))
 
     # Handle reorganize
@@ -445,7 +472,7 @@ def main() -> None:
     }
 
     newly_fetched: dict[str, int | None] = {}
-    uncached_pending = [u for u in pending if u not in cached_sizes]
+    uncached_pending = [u for u in pending if u not in cached_sizes and not is_hls_url(u)]
     session = make_session()
     if uncached_pending:
         print(
@@ -462,17 +489,19 @@ def main() -> None:
     total_bytes = sum(sized.values())
     print(f"[+] Download size: {fmt_size(total_bytes)} across {len(pending)} files")
 
-    if already:
-        uncached_already = [u for u in already if u not in cached_sizes]
+    already_sizes: dict[str, int | None] = {}
+    already_to_verify = [u for u in already if not is_hls_url(u)]
+    if already_to_verify:
+        uncached_already = [u for u in already_to_verify if u not in cached_sizes]
         if uncached_already:
             print(
-                f"[+] Verifying {len(already)} existing files ({len(uncached_already)} uncached)…"
+                f"[+] Verifying {len(already_to_verify)} existing files ({len(uncached_already)} uncached)…"
             )
             fetched_already = fetch_sizes(uncached_already, workers=20, url_referers=url_referers)
             newly_fetched.update(fetched_already)
-            already_sizes: dict[str, int | None] = {**cached_sizes, **fetched_already}
+            already_sizes = {**cached_sizes, **fetched_already}
         else:
-            print(f"[+] Verifying {len(already)} existing files (all sizes cached)…")
+            print(f"[+] Verifying {len(already_to_verify)} existing files (all sizes cached)…")
             already_sizes = dict(cached_sizes)
 
     mismatched = 0
@@ -505,6 +534,8 @@ def main() -> None:
 
     def do_download(url: str) -> tuple[str, tuple[str, int]]:
         dest = paths[url]
+        if is_hls_url(url):
+            return url, download_hls(url, dest, url_referers.get(url, ""))
         expected = remote_sizes.get(url)
         return url, download_one(
             session, url, dest, expected, url_referers.get(url, "")

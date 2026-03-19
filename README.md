@@ -44,7 +44,7 @@ Sites with no credentials are skipped automatically when running `python main.py
 
 ### 1. Scrape
 
-Discovers all post URLs via the WordPress REST API, then visits each page with a headless Firefox browser to intercept video network requests (MP4, MOV, WebM, AVI, M4V).
+Discovers all post URLs via the WordPress REST API, then visits each page with a headless Firefox browser to intercept video network requests (MP4, MOV, WebM, AVI, M4V, HLS/M3U8).
 
 ```bash
 python main.py                    # scrape all sites you have credentials for
@@ -62,7 +62,7 @@ python download.py [options]
 Options:
   -o, --output DIR      Download directory (default: downloads)
   -t, --titles          Name files by post title
-      --original        Name files by original CloudFront filename (default)
+      --original        Name files by original filename derived from the video URL (default)
       --reorganize      Rename existing files to match current naming mode
   -w, --workers N       Concurrent downloads (default: 4)
   -n, --dry-run         Print what would be downloaded

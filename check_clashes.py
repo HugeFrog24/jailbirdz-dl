@@ -121,17 +121,21 @@ def save_video_map(
 
 
 def build_url_referers(video_map: dict[str, Any]) -> dict[str, str]:
-    """Pure function: return {cdn_video_url: site_referer} from a flat video map.
+    """Pure function: return {cdn_video_url: referer} from a flat video map.
 
-    The flat video map has page URLs as keys; the scheme+netloc of each page URL
-    is used as the Referer for all CDN video URLs found in that entry.
+    Bunny.net CDN URLs require https://player.mediadelivery.net/ as referer.
+    All other URLs use the scheme+netloc of the page they were found on.
     """
     result: dict[str, str] = {}
     for page_url, entry in video_map.items():
         parsed = urlparse(page_url)
-        referer = f"{parsed.scheme}://{parsed.netloc}/"
+        site_referer = f"{parsed.scheme}://{parsed.netloc}/"
         for vid in cast(dict[str, Any], entry).get("videos", []):
-            result.setdefault(vid["url"], referer)
+            vid_url = vid["url"]
+            if urlparse(vid_url).netloc.endswith(".b-cdn.net"):
+                result.setdefault(vid_url, "https://player.mediadelivery.net/")
+            else:
+                result.setdefault(vid_url, site_referer)
     return result
 
 
@@ -147,8 +151,17 @@ def fmt_size(b: float | int) -> str:
     return f"{b:.1f} TB"
 
 
+def is_hls_url(url: str) -> bool:
+    """True if url is an HLS master playlist (.m3u8)."""
+    return urlparse(url).path.endswith(".m3u8")
+
+
 def url_to_filename(url: str) -> str:
-    return unquote(PurePosixPath(urlparse(url).path).name)
+    path = PurePosixPath(urlparse(url).path)
+    # Bunny.net HLS: .../guid/playlist.m3u8 → guid.mp4
+    if path.name == "playlist.m3u8":
+        return unquote(path.parent.name) + ".mp4"
+    return unquote(path.name)
 
 
 def find_clashes(urls: list[str]) -> dict[str, list[str]]:

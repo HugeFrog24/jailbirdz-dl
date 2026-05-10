@@ -1,3 +1,6 @@
+# Local Claude instructions
+.claude/settings.local.json
+
 # Temporary cache
 __pycache__/
 .ruff_cache/

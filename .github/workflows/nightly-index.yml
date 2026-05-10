@@ -38,6 +38,8 @@ jobs:
           JAILBIRDZ_PASSWORD: ${{ secrets.JAILBIRDZ_PASSWORD }}
           PINKCUFFS_USERNAME: ${{ secrets.PINKCUFFS_USERNAME }}
           PINKCUFFS_PASSWORD: ${{ secrets.PINKCUFFS_PASSWORD }}
+          FEMUNIVERSE_USERNAME: ${{ secrets.FEMUNIVERSE_USERNAME }}
+          FEMUNIVERSE_PASSWORD: ${{ secrets.FEMUNIVERSE_PASSWORD }}
 
       - name: Commit updated video_map.json
         if: always()  # save progress even if main.py crashed or timed out

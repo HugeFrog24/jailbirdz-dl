@@ -15,4 +15,9 @@ SITES: Final[dict[str, dict[str, str]]] = {
         "cookie_domain": "pinkcuffs.com",
         "env_prefix": "PINKCUFFS",
     },
+    "femuniverse": {
+        "base_url": "https://www.femuniverse.com",
+        "cookie_domain": "femuniverse.com",
+        "env_prefix": "FEMUNIVERSE",
+    },
 }

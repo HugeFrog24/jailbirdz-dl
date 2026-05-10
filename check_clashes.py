@@ -178,27 +178,72 @@ def find_clashes(urls: list[str]) -> dict[str, list[str]]:
     }
 
 
-def _clash_subfolder(url: str) -> str:
-    """Parent path segment used as disambiguator for clashing filenames."""
-    parts = urlparse(url).path.rstrip("/").split("/")
-    return unquote(parts[-2]) if len(parts) >= 2 else "unknown"
+def _path_folders(url: str) -> list[str]:
+    """Decoded URL path segments above the filename (filename excluded)."""
+    parts = [unquote(p) for p in urlparse(url).path.split("/") if p]
+    return parts[:-1]
+
+
+def _disambiguate_group(group: list[str]) -> dict[str, tuple[str, ...]]:
+    """Find the smallest depth of trailing folder segments that gives every URL in the group
+    a unique subfolder path. Returns {url: subfolder_segments}.
+
+    Comparison is case-insensitive so the result is safe on NTFS/APFS as well as ext4.
+    """
+    folders = {u: _path_folders(u) for u in group}
+    max_depth = max((len(f) for f in folders.values()), default=0)
+
+    for depth in range(1, max_depth + 1):
+        keys = {u: tuple(p.lower() for p in folders[u][-depth:]) for u in group}
+        if len(set(keys.values())) == len(group):
+            return {u: tuple(folders[u][-depth:]) for u in group}
+
+    raise RuntimeError(
+        f"Cannot disambiguate URL group sharing filename and full parent path: {group}"
+    )
 
 
 def build_download_paths(
     urls: list[str],
     output_dir: str | Path,
 ) -> dict[str, Path]:
-    """Map each URL to a local file path. Flat layout; clashing names get a subfolder."""
-    clashes = find_clashes(urls)
-    clash_lower = {name.lower() for name in clashes}
+    """Map each URL to a unique local file path.
 
-    paths = {}
+    Unique filenames go directly under output_dir. Filenames that clash
+    (case-insensitively) get the smallest tail of their URL path prepended
+    that makes every URL in the clashing group unique — e.g. /2018/Daisy/foo.mp4
+    and /2023/Daisy/foo.mp4 land at 2018/Daisy/foo.mp4 and 2023/Daisy/foo.mp4
+    rather than colliding at Daisy/foo.mp4.
+    """
+    by_lower: defaultdict[str, list[str]] = defaultdict(list)
     for url in urls:
-        filename = url_to_filename(url)
-        if filename.lower() in clash_lower:
-            paths[url] = Path(output_dir) / _clash_subfolder(url) / filename
-        else:
-            paths[url] = Path(output_dir) / filename
+        by_lower[url_to_filename(url).lower()].append(url)
+
+    base = Path(output_dir)
+    paths: dict[str, Path] = {}
+
+    for group in by_lower.values():
+        if len(group) == 1:
+            url = group[0]
+            paths[url] = base / url_to_filename(url)
+            continue
+        subfolders = _disambiguate_group(group)
+        for url in group:
+            paths[url] = base.joinpath(*subfolders[url]) / url_to_filename(url)
+
+    # Defensive: every URL must map to a distinct destination path.
+    # Case-fold the comparison since callers commonly run on NTFS/APFS where
+    # "Daisy/foo" and "daisy/foo" are the same file on disk.
+    seen: dict[str, str] = {}
+    for url, p in paths.items():
+        key = str(p).lower()
+        if key in seen:
+            raise RuntimeError(
+                f"Path collision after disambiguation: {url!r} and {seen[key]!r} "
+                f"both map to {p}"
+            )
+        seen[key] = url
+
     return paths
 
 

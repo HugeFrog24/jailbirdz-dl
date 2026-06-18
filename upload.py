@@ -49,6 +49,7 @@ DEFAULT_BATCH_SIZE = 1
 DEFAULT_POLL = 30
 UPLOADED_FILE = ".uploaded"
 PT_NAME_MAX = 120
+PT_DESC_MIN = 3  # PeerTube rejects descriptions shorter than this
 
 
 # ── Text helpers ─────────────────────────────────────────────────────
@@ -62,6 +63,11 @@ def clean_description(raw: str) -> str:
     text = re.sub(r"<[^>]+>", "", text)
     text = html.unescape(text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    # PeerTube enforces a 3-char minimum on descriptions; a sub-minimum
+    # description (e.g. a stray ".") makes the upload-init 400.  Drop it so
+    # it's omitted from the request rather than rejected.
+    if len(text) < PT_DESC_MIN:
+        return ""
     return text[:10000]
 
 

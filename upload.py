@@ -8,7 +8,7 @@ Usage:
     python upload.py                      # upload from ./downloads
     python upload.py -i /mnt/vol/dl      # custom input dir
     python upload.py --batch-size 2      # upload 2, wait, repeat
-    python upload.py --dry-run           # preview without uploading
+    python upload.py --dry-run           # preview (checks the channel, uploads nothing)
     python upload.py --skip-wait         # upload without waiting
 
 Required (CLI flag or env var):
@@ -32,6 +32,7 @@ import requests
 from dotenv import load_dotenv
 
 from check_clashes import fmt_size, url_to_filename, VIDEO_EXTS, load_video_map
+from config import SITES
 from download import (
     collect_urls,
     get_paths_for_mode,
@@ -448,14 +449,43 @@ def build_path_to_meta(
     return result
 
 
-def find_videos(input_dir: str) -> set[Path]:
-    """Walk input_dir and return a set of relative paths for all video files."""
+def site_dirs_in(input_dir: str) -> set[str]:
+    """Names of the per-site subdirectories that actually exist under input_dir."""
+    root = Path(input_dir)
+    if not root.is_dir():
+        return set()
+    return {site for site in SITES if (root / site).is_dir()}
+
+
+def unmanaged_dirs_in(input_dir: str, site_dirs: set[str]) -> list[str]:
+    """Top-level subdirectories of input_dir that belong to no configured site."""
+    root = Path(input_dir)
+    if not root.is_dir():
+        return []
+    return sorted(
+        d.name
+        for d in root.iterdir()
+        if d.is_dir() and not d.name.startswith(".") and d.name not in site_dirs
+    )
+
+
+def find_videos(input_dir: str, only_dirs: set[str] | None = None) -> set[Path]:
+    """Walk input_dir and return a set of relative paths for all video files.
+
+    When *only_dirs* is given, just those top-level directories are descended
+    into; loose files sitting directly in input_dir are always included.  That
+    keeps a shared parent directory — an external drive holding other purchases
+    next to the site folders — from dragging in unrelated albums.
+    """
+    top = Path(input_dir)
     found = set()
-    for root, dirs, files in os.walk(input_dir):
+    for cur, dirs, files in os.walk(str(top)):
         dirs[:] = [d for d in dirs if not d.startswith(".")]
+        if only_dirs is not None and Path(cur) == top:
+            dirs[:] = [d for d in dirs if d in only_dirs]
         for f in files:
             if Path(f).suffix.lower() in VIDEO_EXTS:
-                found.add((Path(root) / f).relative_to(input_dir))
+                found.add((Path(cur) / f).relative_to(top))
     return found
 
 
@@ -532,6 +562,11 @@ def main() -> None:
     ap.add_argument(
         "--dry-run", "-n", action="store_true", help="Preview what would be uploaded"
     )
+    ap.add_argument(
+        "--scan-all",
+        action="store_true",
+        help="Scan every subdirectory of --input, not just the configured site folders",
+    )
     args = ap.parse_args()
 
     url = args.url or os.environ.get("PEERTUBE_URL")
@@ -539,26 +574,42 @@ def main() -> None:
     channel = args.channel or os.environ.get("PEERTUBE_CHANNEL")
     password = args.password or os.environ.get("PEERTUBE_PASSWORD")
 
-    if not args.dry_run:
-        missing = [
-            label
-            for label, val in [
-                ("--url / PEERTUBE_URL", url),
-                ("--username / PEERTUBE_USER", username),
-                ("--channel / PEERTUBE_CHANNEL", channel),
-                ("--password / PEERTUBE_PASSWORD", password),
-            ]
-            if not val
+    missing = [
+        label
+        for label, val in [
+            ("--url / PEERTUBE_URL", url),
+            ("--username / PEERTUBE_USER", username),
+            ("--channel / PEERTUBE_CHANNEL", channel),
+            ("--password / PEERTUBE_PASSWORD", password),
         ]
-        if missing:
-            for label in missing:
-                print(f"[!] Required: {label}")
-            sys.exit(1)
+        if not val
+    ]
+    have_creds = not missing
+    if missing and not args.dry_run:
+        for label in missing:
+            print(f"[!] Required: {label}")
+        sys.exit(1)
 
     # ── load metadata & scan disk ──
     video_map = load_video_map()
     path_meta = build_path_to_meta(video_map, args.input)
-    on_disk = find_videos(args.input)
+
+    # --input may be a shared directory that holds unrelated purchases beside
+    # the per-site folders.  Once any site folder is present, treat the layout
+    # as site-partitioned and ignore everything else; a flat directory (no site
+    # folders at all) is still walked in full.
+    site_dirs = set() if args.scan_all else site_dirs_in(args.input)
+    if site_dirs:
+        skipped = unmanaged_dirs_in(args.input, site_dirs)
+        if skipped:
+            print(
+                f"[!] Ignoring {len(skipped)} unmanaged folder(s) in {args.input}: "
+                f"{', '.join(skipped)}"
+            )
+            print("    (pass --scan-all to upload those too)")
+        on_disk = find_videos(args.input, site_dirs)
+    else:
+        on_disk = find_videos(args.input)
 
     unmatched = on_disk - set(path_meta.keys())
     if unmatched:
@@ -568,16 +619,90 @@ def main() -> None:
         for rel in unmatched:
             path_meta[rel] = {"title": "", "description": ""}
 
+    ledger = Path(args.input) / UPLOADED_FILE
     uploaded = load_uploaded(args.input)
     pending = sorted(rel for rel in on_disk if rel not in uploaded)
 
     print(f"[+] {len(on_disk)} video files in {args.input}/")
-    print(f"[+] {len(uploaded)} already uploaded")
+    print(f"[+] {len(uploaded)} already uploaded (per {ledger})")
     print(f"[+] {len(pending)} pending")
     print(f"[+] Batch size: {args.batch_size}")
 
     if not pending:
         print("\nAll videos already uploaded.")
+        return
+
+    # ── connect to the channel ────────────────────────────────────────
+    # The .uploaded ledger lives inside --input, so pointing at a fresh
+    # directory (an external drive, say) starts from an empty one.  The channel
+    # is the real source of truth, so reconcile against it before deciding what
+    # is pending — dry runs included, whenever credentials are available.
+    base = ""
+    token = ""
+    channel_id = 0
+    existing: set[str] = set()
+
+    if have_creds:
+        assert url is not None
+        assert username is not None
+        assert channel is not None
+        assert password is not None
+
+        base = url.rstrip("/")
+        if not base.startswith("http"):
+            base = "https://" + base
+
+        print(f"\n[+] Authenticating with {base} ...")
+        token = get_oauth_token(base, username, password)
+        print(f"[+] Authenticated as {username}")
+
+        channel_id = get_channel_id(base, token, channel)
+        print(f"[+] Channel: {channel} (id {channel_id})")
+
+        name_counts = get_channel_video_names(base, token, channel)
+        existing = set(name_counts)
+        total = sum(name_counts.values())
+        print(
+            f"[+] Found {total} video(s) on channel ({len(name_counts)} unique name(s))"
+        )
+
+        dupes = {name: count for name, count in name_counts.items() if count > 1}
+        if dupes:
+            print(f"[!] {len(dupes)} duplicate name(s) detected on channel:")
+            for name, count in sorted(dupes.items()):
+                print(f"    x{count}  {name}")
+    else:
+        print(
+            "\n[!] No PeerTube credentials given — skipping the channel check; "
+            "everything below is reported as pending."
+        )
+
+    # ── pre-reconcile: sweep all pending against channel names ────────
+    # The main upload loop discovers already-uploaded videos lazily as it
+    # walks the sorted pending list — meaning on a fresh run (no .uploaded
+    # file) you won't know how many files are genuinely new until the loop
+    # has processed everything.  Doing a full sweep here, before any
+    # upload starts, gives an accurate count up-front and pre-populates
+    # .uploaded so that interrupted/re-run sessions skip them instantly
+    # without re-checking each time.  A dry run sweeps but writes nothing.
+    if existing:
+        pre_matched = [
+            rel for rel in pending if _channel_match(rel, path_meta, existing)[0]
+        ]
+        if pre_matched:
+            suffix = "" if args.dry_run else " — marking uploaded"
+            print(
+                f"\n[+] Pre-sweep: {len(pre_matched)} local file(s) already on channel{suffix}"
+            )
+            if not args.dry_run:
+                for rel in pre_matched:
+                    mark_uploaded(args.input, rel)
+            matched = set(pre_matched)
+            pending = [rel for rel in pending if rel not in matched]
+            print(f"[+] {len(pending)} left to upload\n")
+
+    if not pending:
+        print("All videos already uploaded.")
         return
 
     # ── dry run ──
@@ -591,55 +716,6 @@ def main() -> None:
             print(f"  [{fmt_size(sz):>10}]  {name}")
         print(f"\n  Total: {fmt_size(total_bytes)} across {len(pending)} videos")
         return
-
-    assert url is not None
-    assert username is not None
-    assert channel is not None
-    assert password is not None
-
-    # ── authenticate ──
-    base = url.rstrip("/")
-    if not base.startswith("http"):
-        base = "https://" + base
-
-    print(f"\n[+] Authenticating with {base} ...")
-    token = get_oauth_token(base, username, password)
-    print(f"[+] Authenticated as {username}")
-
-    channel_id = get_channel_id(base, token, channel)
-    print(f"[+] Channel: {channel} (id {channel_id})")
-
-    name_counts = get_channel_video_names(base, token, channel)
-    existing = set(name_counts)
-    total = sum(name_counts.values())
-    print(f"[+] Found {total} video(s) on channel ({len(name_counts)} unique name(s))")
-
-    dupes = {name: count for name, count in name_counts.items() if count > 1}
-    if dupes:
-        print(f"[!] {len(dupes)} duplicate name(s) detected on channel:")
-        for name, count in sorted(dupes.items()):
-            print(f"    x{count}  {name}")
-
-    # ── pre-reconcile: sweep all pending against channel names ────────
-    # The main upload loop discovers already-uploaded videos lazily as it
-    # walks the sorted pending list — meaning on a fresh run (no .uploaded
-    # file) you won't know how many files are genuinely new until the loop
-    # has processed everything.  Doing a full sweep here, before any
-    # upload starts, gives an accurate count up-front and pre-populates
-    # .uploaded so that interrupted/re-run sessions skip them instantly
-    # without re-checking each time.
-    pre_matched = []
-    for rel in pending:
-        if _channel_match(rel, path_meta, existing)[0]:
-            pre_matched.append(rel)
-    if pre_matched:
-        print(
-            f"\n[+] Pre-sweep: {len(pre_matched)} local file(s) already on channel — marking uploaded"
-        )
-        for rel in pre_matched:
-            mark_uploaded(args.input, rel)
-        pending = [rel for rel in pending if rel not in set(pre_matched)]
-        print(f"[+] {len(pending)} left to upload\n")
 
     nsfw = args.nsfw
     total_up = 0
@@ -703,4 +779,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        # Downstream reader closed the pipe (e.g. `| head`).  Point stdout at
+        # devnull so interpreter shutdown does not raise a second time.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)

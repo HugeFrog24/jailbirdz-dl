@@ -89,10 +89,13 @@ Options:
       --poll-interval SECS  State poll interval in seconds (default: 30)
       --skip-wait           Upload without waiting for transcoding
       --nsfw                Mark videos as NSFW
-  -n, --dry-run             Print what would be uploaded
+  -n, --dry-run             Print what would be uploaded (checks the channel, uploads nothing)
+      --scan-all            Scan every subdirectory of --input, not just the site folders
 ```
 
-Uploads in resumable 10 MB chunks. After each batch, waits for transcoding and object storage to complete before uploading the next batch — this prevents disk exhaustion on the PeerTube server. Videos already present on the channel (matched by name) are skipped. Progress is tracked in `.uploaded` inside the input directory.
+Uploads in resumable 10 MB chunks. After each batch, waits for transcoding and object storage to complete before uploading the next batch — this prevents disk exhaustion on the PeerTube server. Videos already present on the channel (matched by name) are skipped. If `--input` contains any of the configured site folders (`jailbirdz`, `pinkcuffs`, `femuniverse`), only those are scanned — so the input directory can be a shared drive holding unrelated purchases alongside them. Anything skipped is listed on startup; `--scan-all` includes it. A directory with no site folders is walked in full.
+
+Progress is tracked in `.uploaded` inside the input directory, so a new `--input` directory starts with an empty ledger — the channel itself is reconciled against on every run (dry runs included) to fill it back in.
 
 ## CI / Nightly Indexing
 
